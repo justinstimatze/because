@@ -43,6 +43,8 @@ const (
 	maxRowChars = 800
 	maxActive   = 500
 	maxMessage  = 9000
+	loudWindow  = 30 * 24 * time.Hour
+	loudAfter   = 5 // sessions within loudWindow
 )
 
 func main() {
@@ -134,14 +136,17 @@ func runHook(in io.Reader, out io.Writer, now time.Time) error {
 	switch h.Event {
 	case "SessionStart":
 		sweepSeen(now)
-		hits := loadHits()
-		lapsed, quiet := 0, 0
+		compactHits(now)
+		hits, recent := loadHits(), recentSessions(now)
+		lapsed, quiet, loud := 0, 0, 0
 		for _, r := range t.Active {
 			switch {
 			case r.Lapsed(now):
 				lapsed++
 			case r.Quiet(hits[r.ID], now):
 				quiet++
+			case isLoud(r, recent):
+				loud++
 			}
 		}
 		var parts []string
@@ -150,6 +155,9 @@ func runHook(in io.Reader, out io.Writer, now time.Time) error {
 		}
 		if quiet > 0 {
 			parts = append(parts, fmt.Sprintf("%d open row(s) have not surfaced in %d days", quiet, int(quietLife.Hours()/24)))
+		}
+		if loud > 0 {
+			parts = append(parts, fmt.Sprintf("%d row(s) surfaced in more than %d sessions this month", loud, loudAfter))
 		}
 		if len(parts) > 0 {
 			emitContext(out, h.Event, "because: "+strings.Join(parts, "; ")+". Run `because review` to retire, renew or date them.")
@@ -310,36 +318,81 @@ func unseen(session string, rows []Row, now time.Time) []Row {
 	return out
 }
 
+// isLoud reports a row that surfaced in more than loudAfter sessions within loudWindow, which
+// usually means its match is wider than its cause. `never` rows are exempt: that is how a row whose
+// error genuinely recurs opts out.
+func isLoud(r Row, recent map[string]int) bool {
+	return r.Until != "never" && recent[r.ID] > loudAfter
+}
+
 func hitsPath() string { return filepath.Join(stateDir(), "hits.tsv") }
 
-// loadHits reads the last date each row surfaced, as id → YYYY-MM-DD.
-func loadHits() map[string]string {
-	m := map[string]string{}
+// readHits returns the hit log: one "id<TAB>YYYY-MM-DD" line each time a row surfaced in a
+// session. Rows surface once per session, so a line is a session.
+func readHits() [][2]string {
 	b, err := os.ReadFile(hitsPath())
 	if err != nil {
-		return m
+		return nil
 	}
+	var out [][2]string
 	for _, line := range strings.Split(string(b), "\n") {
 		if id, day, ok := strings.Cut(line, "\t"); ok {
-			m[id] = day
+			out = append(out, [2]string{id, day})
+		}
+	}
+	return out
+}
+
+// loadHits returns the last date each row surfaced, as id → YYYY-MM-DD.
+func loadHits() map[string]string {
+	m := map[string]string{}
+	for _, h := range readHits() {
+		if h[1] > m[h[0]] {
+			m[h[0]] = h[1]
+		}
+	}
+	return m
+}
+
+// recentSessions counts, per row, the sessions it surfaced in during the last loudWindow.
+func recentSessions(now time.Time) map[string]int {
+	from := now.Add(-loudWindow).Format(dateLayout)
+	m := map[string]int{}
+	for _, h := range readHits() {
+		if h[1] >= from {
+			m[h[0]]++
 		}
 	}
 	return m
 }
 
 func recordHits(rows []Row, now time.Time) {
-	m := loadHits()
+	f, err := os.OpenFile(hitsPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
 	for _, r := range rows {
-		m[r.ID] = now.Format(dateLayout)
+		fmt.Fprintf(f, "%s\t%s\n", r.ID, now.Format(dateLayout))
 	}
-	ids := make([]string, 0, len(m))
-	for id := range m {
-		ids = append(ids, id)
+}
+
+// compactHits drops log lines older than loudWindow, keeping each row's latest so quiet is still
+// measured from it.
+func compactHits(now time.Time) {
+	hits := readHits()
+	if len(hits) == 0 {
+		return
 	}
-	sort.Strings(ids)
+	from := now.Add(-loudWindow).Format(dateLayout)
+	last := loadHits()
 	var b strings.Builder
-	for _, id := range ids {
-		fmt.Fprintf(&b, "%s\t%s\n", id, m[id])
+	kept := map[string]bool{}
+	for _, h := range hits {
+		if h[1] >= from || (h[1] == last[h[0]] && !kept[h[0]]) {
+			kept[h[0]] = true
+			fmt.Fprintf(&b, "%s\t%s\n", h[0], h[1])
+		}
 	}
 	tmp := hitsPath() + ".tmp"
 	if os.WriteFile(tmp, []byte(b.String()), 0o600) == nil {
@@ -478,7 +531,7 @@ func runLint(out io.Writer, now time.Time) error {
 		}
 		ids[r.ID] = r.Line
 	}
-	hits := loadHits()
+	hits, recent := loadHits(), recentSessions(now)
 	for _, r := range t.Active {
 		state := "active"
 		switch {
@@ -486,6 +539,8 @@ func runLint(out io.Writer, now time.Time) error {
 			state = "LAPSED"
 		case r.Quiet(hits[r.ID], now):
 			state = "QUIET"
+		case isLoud(r, recent):
+			state = "LOUD"
 		}
 		fmt.Fprintf(out, "%-6s %-24s %-5s until %-10s last hit %s\n", state, r.ID, r.Where, expiryText(r), orNone(hits[r.ID]))
 	}
@@ -522,6 +577,7 @@ type verdict struct {
 	row    Row
 	retire bool
 	quiet  bool
+	loud   bool
 	why    string
 }
 
@@ -533,7 +589,7 @@ func runReview(out io.Writer, apply bool, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	hits := loadHits()
+	hits, recent := loadHits(), recentSessions(now)
 	var vs []verdict
 	for _, r := range t.Active {
 		v := verdict{row: r}
@@ -558,13 +614,20 @@ func runReview(out io.Writer, apply bool, now time.Time) error {
 			v.quiet = true
 			v.why += fmt.Sprintf("; quiet: no hit since %s", orNone(hits[r.ID]))
 		}
+		if isLoud(r, recent) && !v.retire {
+			v.loud = true
+			v.why += fmt.Sprintf("; loud: surfaced in %d sessions in %d days", recent[r.ID], int(loudWindow.Hours()/24))
+		}
 		vs = append(vs, v)
 	}
-	retiring, quiet := 0, 0
+	retiring, quiet, loud := 0, 0, 0
 	for _, v := range vs {
 		mark := "keep  "
 		if v.quiet {
 			mark, quiet = "QUIET ", quiet+1
+		}
+		if v.loud {
+			mark, loud = "LOUD  ", loud+1
 		}
 		if v.retire {
 			mark, retiring = "RETIRE", retiring+1
@@ -573,6 +636,9 @@ func runReview(out io.Writer, apply bool, now time.Time) error {
 	}
 	if quiet > 0 {
 		fmt.Fprintf(out, "%d open row(s) quiet for %d days. Each still matches; give it an until date, `never`, or a failing check, or move it under %q yourself.\n", quiet, int(quietLife.Hours()/24), resolvedMarker)
+	}
+	if loud > 0 {
+		fmt.Fprintf(out, "%d row(s) loud. Check each match is as narrow as its cause; mark a row whose error genuinely recurs `never`.\n", loud)
 	}
 	if retiring == 0 || !apply {
 		if retiring > 0 {

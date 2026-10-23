@@ -406,3 +406,29 @@ func BenchmarkHitsOnALongLog(b *testing.B) {
 		tb.Hits("out", text, today)
 	}
 }
+
+func TestARowSurfacingInManySessionsIsLoudUnlessNever(t *testing.T) {
+	setup(t, "wide\tboom\tout\tc\t2026-10-01\t-\t-\ts\nrecurs\tbang\tout\tc\t2026-10-01\tnever\t-\ts\n")
+	for i := range loudAfter + 1 {
+		hook(t, map[string]any{
+			"hook_event_name": "PostToolUse", "session_id": fmt.Sprintf("s%d", i), "tool_input": map[string]any{"command": "x"},
+			"tool_response": map[string]any{"stdout": "boom bang"},
+		})
+	}
+	recent := recentSessions(today)
+	tb, _ := load()
+	if !isLoud(tb.Active[0], recent) {
+		t.Fatalf("wide row not loud after %d sessions", recent["wide"])
+	}
+	if isLoud(tb.Active[1], recent) {
+		t.Fatal("a never row was flagged loud")
+	}
+	var out bytes.Buffer
+	if err := runReview(&out, false, today); err != nil || !strings.Contains(out.String(), "LOUD   wide") {
+		t.Fatalf("review did not list it: %v\n%s", err, out.String())
+	}
+	compactHits(today.Add(90 * 24 * time.Hour))
+	if loadHits()["wide"] != today.Format(dateLayout) || recentSessions(today.Add(90 * 24 * time.Hour))["wide"] != 0 {
+		t.Fatal("compaction lost the last hit or kept old sessions")
+	}
+}

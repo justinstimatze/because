@@ -17,7 +17,8 @@ text arrives:
 
 A row surfaces at most once per session, at most three rows per hit. Each is framed as a hypothesis
 with its check command; whether to run it is the agent's call. At session start the hook
-stays quiet unless some row has passed its until date or gone quiet (below), and then it says so
+stays quiet unless some row has passed its until date, gone quiet or gone loud (below), and then it
+says so
 in one line.
 
 ## The table
@@ -51,6 +52,10 @@ session-start line list it until you give it an until date, mark it `never`, or 
 `# resolved` yourself. That is the pressure that keeps the table relevant; nothing retires on age
 alone.
 
+The opposite signal is loud: a row that surfaced in more than five sessions in 30 days. That
+usually means the match is wider than the cause, so `lint` and `review` list it for narrowing. A
+row whose error genuinely keeps recurring can be marked `never`, which exempts it.
+
 ### Skipping documentation
 
 A cause gets written down in tickets and notes, so reading those would match the row that
@@ -64,8 +69,8 @@ regex over the call's input, such as a command that greps a notes file. Each may
 
 The hook records which rows a session has seen under `$BECAUSE_STATE_DIR` (default
 `because/` in your user cache directory, `~/.cache/because` on Linux), and removes those records
-after 14 days. The date each row last surfaced goes in `hits.tsv` there, which is what quiet is
-measured from.
+after 14 days. Each time a row surfaces, a dated line goes in `hits.tsv` there; quiet and loud
+are measured from it, and lines older than 30 days are dropped except each row's latest.
 
 ## Example
 
