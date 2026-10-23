@@ -134,28 +134,40 @@ func runHook(in io.Reader, out io.Writer, now time.Time) error {
 	switch h.Event {
 	case "SessionStart":
 		sweepSeen(now)
-		lapsed := 0
+		hits := loadHits()
+		lapsed, quiet := 0, 0
 		for _, r := range t.Active {
-			if r.Lapsed(now) {
+			switch {
+			case r.Lapsed(now):
 				lapsed++
+			case r.Quiet(hits[r.ID], now):
+				quiet++
 			}
 		}
+		var parts []string
 		if lapsed > 0 {
-			emitContext(out, h.Event, fmt.Sprintf("because: %d known-cause row(s) are past their until date and no longer surface. Run `because review` to retire or renew them.", lapsed))
+			parts = append(parts, fmt.Sprintf("%d known-cause row(s) are past their until date and no longer surface", lapsed))
+		}
+		if quiet > 0 {
+			parts = append(parts, fmt.Sprintf("%d open row(s) have not surfaced in %d days", quiet, int(quietLife.Hours()/24)))
+		}
+		if len(parts) > 0 {
+			emitContext(out, h.Event, "because: "+strings.Join(parts, "; ")+". Run `because review` to retire, renew or date them.")
 		}
 	case "PreToolUse":
-		if touchesTable(h.ToolInput) {
+		input := haystack(h.ToolInput)
+		if touchesTable(h.ToolInput) || t.Skip(h.ToolName, input) {
 			return nil
 		}
-		hits := unseen(h.SessionID, t.Hits("in", haystack(h.ToolInput), now))
+		hits := unseen(h.SessionID, t.Hits("in", input, now), now)
 		if len(hits) > 0 {
 			emitContext(out, h.Event, render(hits, "This tool call names something with a known cause."))
 		}
 	case "PostToolUse":
-		if touchesTable(h.ToolInput) {
+		if touchesTable(h.ToolInput) || t.Skip(h.ToolName, haystack(h.ToolInput)) {
 			return nil
 		}
-		hits := unseen(h.SessionID, t.Hits("out", haystack(h.ToolResponse), now))
+		hits := unseen(h.SessionID, t.Hits("out", haystack(h.ToolResponse), now), now)
 		if len(hits) > 0 {
 			emitContext(out, h.Event, render(hits, "That output matches a known cause."))
 		}
@@ -167,7 +179,7 @@ func runHook(in io.Reader, out io.Writer, now time.Time) error {
 		if err != nil || text == "" {
 			return nil
 		}
-		hits := unseen(h.SessionID, t.Hits("reply", prose(text), now))
+		hits := unseen(h.SessionID, t.Hits("reply", prose(text), now), now)
 		if len(hits) > 0 {
 			msg := render(hits, "Your reply rests on a premise with a recorded correction.") +
 				"\nRevise the reply if the correction applies; if it doesn't, stop as you were."
@@ -265,8 +277,9 @@ func capped(s string) string {
 }
 
 // unseen keeps the first maxHits rows this session has not been shown, and records them, so one
-// cause surfaces once per session rather than on every matching call.
-func unseen(session string, rows []Row) []Row {
+// cause surfaces once per session rather than on every matching call. It also stamps each shown
+// row's last-hit date, which is what review's quiet check reads.
+func unseen(session string, rows []Row, now time.Time) []Row {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -292,8 +305,46 @@ func unseen(session string, rows []Row) []Row {
 			}
 			f.Close()
 		}
+		recordHits(out, now)
 	}
 	return out
+}
+
+func hitsPath() string { return filepath.Join(stateDir(), "hits.tsv") }
+
+// loadHits reads the last date each row surfaced, as id → YYYY-MM-DD.
+func loadHits() map[string]string {
+	m := map[string]string{}
+	b, err := os.ReadFile(hitsPath())
+	if err != nil {
+		return m
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if id, day, ok := strings.Cut(line, "\t"); ok {
+			m[id] = day
+		}
+	}
+	return m
+}
+
+func recordHits(rows []Row, now time.Time) {
+	m := loadHits()
+	for _, r := range rows {
+		m[r.ID] = now.Format(dateLayout)
+	}
+	ids := make([]string, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var b strings.Builder
+	for _, id := range ids {
+		fmt.Fprintf(&b, "%s\t%s\n", id, m[id])
+	}
+	tmp := hitsPath() + ".tmp"
+	if os.WriteFile(tmp, []byte(b.String()), 0o600) == nil {
+		_ = os.Rename(tmp, hitsPath())
+	}
 }
 
 // sweepSeen removes per-session seen files untouched for seenLife, so the state directory does not
@@ -427,16 +478,16 @@ func runLint(out io.Writer, now time.Time) error {
 		}
 		ids[r.ID] = r.Line
 	}
+	hits := loadHits()
 	for _, r := range t.Active {
 		state := "active"
-		if r.Lapsed(now) {
+		switch {
+		case r.Lapsed(now):
 			state = "LAPSED"
+		case r.Quiet(hits[r.ID], now):
+			state = "QUIET"
 		}
-		exp := "never"
-		if e := r.Expiry(); !e.IsZero() {
-			exp = e.Format(dateLayout)
-		}
-		fmt.Fprintf(out, "%-6s %-24s %-5s until %s\n", state, r.ID, r.Where, exp)
+		fmt.Fprintf(out, "%-6s %-24s %-5s until %-10s last hit %s\n", state, r.ID, r.Where, expiryText(r), orNone(hits[r.ID]))
 	}
 	fmt.Fprintf(out, "%d active, %d resolved\n", len(t.Active), len(t.Resolved))
 	for _, r := range t.Active {
@@ -470,6 +521,7 @@ func runMatch(out io.Writer, where, text string, now time.Time) error {
 type verdict struct {
 	row    Row
 	retire bool
+	quiet  bool
 	why    string
 }
 
@@ -481,9 +533,11 @@ func runReview(out io.Writer, apply bool, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	hits := loadHits()
 	var vs []verdict
 	for _, r := range t.Active {
 		v := verdict{row: r}
+		quiet := r.Quiet(hits[r.ID], now)
 		switch {
 		case r.Lapsed(now):
 			v.retire, v.why = true, "past until "+r.Expiry().Format(dateLayout)
@@ -500,15 +554,25 @@ func runReview(out io.Writer, apply bool, now time.Time) error {
 		default:
 			v.why = "no check; in force until " + expiryText(r)
 		}
+		if quiet && !v.retire {
+			v.quiet = true
+			v.why += fmt.Sprintf("; quiet: no hit since %s", orNone(hits[r.ID]))
+		}
 		vs = append(vs, v)
 	}
-	retiring := 0
+	retiring, quiet := 0, 0
 	for _, v := range vs {
 		mark := "keep  "
+		if v.quiet {
+			mark, quiet = "QUIET ", quiet+1
+		}
 		if v.retire {
 			mark, retiring = "RETIRE", retiring+1
 		}
 		fmt.Fprintf(out, "%s %-24s %s\n", mark, v.row.ID, v.why)
+	}
+	if quiet > 0 {
+		fmt.Fprintf(out, "%d open row(s) quiet for %d days. Each still matches; give it an until date, `never`, or a failing check, or move it under %q yourself.\n", quiet, int(quietLife.Hours()/24), resolvedMarker)
 	}
 	if retiring == 0 || !apply {
 		if retiring > 0 {
@@ -520,10 +584,20 @@ func runReview(out io.Writer, apply bool, now time.Time) error {
 }
 
 func expiryText(r Row) string {
-	if e := r.Expiry(); !e.IsZero() {
-		return e.Format(dateLayout)
+	switch {
+	case r.Until == "":
+		return "open"
+	case r.Until == "never":
+		return "never"
 	}
-	return "never"
+	return r.Until
+}
+
+func orNone(day string) string {
+	if day == "" {
+		return "none"
+	}
+	return day
 }
 
 func runCheck(cmd string) (int, error) {

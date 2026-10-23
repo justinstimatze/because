@@ -81,13 +81,57 @@ func TestALapsedRowStopsMatchingBeforeReviewMovesIt(t *testing.T) {
 	}
 }
 
-func TestEmptyUntilDefaultsToThirtyDaysNotForever(t *testing.T) {
-	r := Row{Since: "2026-10-11"}
-	if got := r.Expiry().Format(dateLayout); got != "2026-11-10" {
-		t.Fatalf("expiry %s", got)
+func TestAnOpenRowNeverLapsesButGoesQuietWithoutHits(t *testing.T) {
+	r := Row{Since: "2026-01-01"}
+	later := time.Date(2026, 12, 1, 0, 0, 0, 0, time.Local)
+	if r.Lapsed(later) {
+		t.Fatal("open row lapsed")
 	}
-	if !r.Lapsed(time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)) {
-		t.Fatal("row with no until never lapsed")
+	if !r.Quiet("", later) {
+		t.Fatal("open row with no hit in eleven months is not quiet")
+	}
+	if r.Quiet("2026-11-20", later) {
+		t.Fatal("row hit eleven days ago is quiet")
+	}
+	if (Row{Since: "2026-01-01", Until: "never"}).Quiet("", later) {
+		t.Fatal("a never row is quiet; never is the way to opt out")
+	}
+}
+
+func TestASurfacedRowStampsItsLastHit(t *testing.T) {
+	setup(t, sample)
+	hook(t, map[string]any{
+		"hook_event_name": "PreToolUse", "session_id": "s", "tool_name": "Bash",
+		"tool_input": map[string]any{"command": "DEPLOY_TOKEN=abc123 ./deploy.sh"},
+	})
+	if got := loadHits()["token"]; got != today.Format(dateLayout) {
+		t.Fatalf("last hit %q", got)
+	}
+}
+
+func TestSkipDirectivesStopMatchesOnDocumentationOfACause(t *testing.T) {
+	setup(t, "#! skip-tools ^mcp__linear\n#! skip-text open-asks\\.md|/memory/\n"+
+		"pat\tDEPLOY_TOKEN\tin\tRotated.\t2026-10-11\t-\t-\tx\n"+
+		"err\tDependabot alerts are disabled\tout\tOff on purpose.\t2026-10-18\t-\t-\tx\n")
+	for name, in := range map[string]map[string]any{
+		"ticket read": {"hook_event_name": "PostToolUse", "session_id": "a", "tool_name": "mcp__linear__get_issue",
+			"tool_input": map[string]any{"id": "X-1"}, "tool_response": map[string]any{"text": "Dependabot alerts are disabled"}},
+		"notes grep": {"hook_event_name": "PreToolUse", "session_id": "b", "tool_name": "Bash",
+			"tool_input": map[string]any{"command": "rg DEPLOY_TOKEN ~/notes/open-asks.md"}},
+	} {
+		if out := hook(t, in); out != "" {
+			t.Errorf("%s surfaced: %q", name, out)
+		}
+	}
+	if out := hook(t, map[string]any{"hook_event_name": "PreToolUse", "session_id": "c", "tool_name": "Bash",
+		"tool_input": map[string]any{"command": "DEPLOY_TOKEN=x ./deploy.sh"}}); out == "" {
+		t.Fatal("a real use was skipped too")
+	}
+}
+
+func TestAnUnknownDirectiveIsAnError(t *testing.T) {
+	if _, err := Parse(strings.NewReader("#! skip-everything .\n")); err == nil {
+		t.Fatal("unknown directive parsed")
 	}
 }
 

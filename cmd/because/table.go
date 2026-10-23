@@ -20,7 +20,7 @@ type Row struct {
 	Where  string // "in" (tool input), "out" (tool output) or "reply" (assistant text at Stop)
 	Cause  string
 	Since  string // YYYY-MM-DD
-	Until  string // YYYY-MM-DD, "never", or empty (Since + defaultLife)
+	Until  string // YYYY-MM-DD, "never", or empty (open: no end date, flagged by review once quiet)
 	Check  string // shell command; exit 0 means the cause still holds
 	Source string
 	Line   int
@@ -31,7 +31,8 @@ type Row struct {
 
 const (
 	resolvedMarker = "# resolved"
-	defaultLife    = 30 * 24 * time.Hour
+	directive      = "#!"
+	quietLife      = 60 * 24 * time.Hour
 	dateLayout     = "2006-01-02"
 	columns        = 8
 )
@@ -44,6 +45,11 @@ type Table struct {
 	Active   []Row
 	Resolved []Row
 	Lines    []string
+	// SkipTools and SkipText come from `#! skip-tools REGEX` and `#! skip-text REGEX` lines. A tool
+	// call whose name matches SkipTools, or whose input matches SkipText, is not matched at all: it
+	// reads documentation of causes (a ticket, a notes file) rather than meeting a symptom.
+	SkipTools *regexp.Regexp
+	SkipText  *regexp.Regexp
 }
 
 // Parse reads the tab-separated table. A malformed row is an error naming its line, never a silent
@@ -63,6 +69,12 @@ func Parse(r io.Reader) (*Table, error) {
 			resolved = true
 			continue
 		}
+		if strings.HasPrefix(trim, directive) {
+			if err := t.parseDirective(strings.TrimSpace(trim[len(directive):]), n); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if trim == "" || strings.HasPrefix(trim, "#") {
 			continue
 		}
@@ -77,6 +89,38 @@ func Parse(r io.Reader) (*Table, error) {
 		}
 	}
 	return t, sc.Err()
+}
+
+func (t *Table) parseDirective(d string, n int) error {
+	name, arg, _ := strings.Cut(d, " ")
+	arg = strings.TrimSpace(arg)
+	var dst **regexp.Regexp
+	switch name {
+	case "skip-tools":
+		dst = &t.SkipTools
+	case "skip-text":
+		dst = &t.SkipText
+	default:
+		return fmt.Errorf("line %d: unknown directive %q (want skip-tools or skip-text)", n, name)
+	}
+	if arg == "" {
+		return fmt.Errorf("line %d: %s needs a regex", n, name)
+	}
+	if *dst != nil {
+		return fmt.Errorf("line %d: %s given twice; join the patterns with |", n, name)
+	}
+	re, err := regexp.Compile(arg)
+	if err != nil {
+		return fmt.Errorf("line %d: %s: %v", n, name, err)
+	}
+	*dst = re
+	return nil
+}
+
+// Skip reports whether a tool call is one whose text should not be matched.
+func (t *Table) Skip(tool, input string) bool {
+	return (t.SkipTools != nil && tool != "" && t.SkipTools.MatchString(tool)) ||
+		(t.SkipText != nil && t.SkipText.MatchString(input))
 }
 
 func parseRow(line string, n int) (Row, error) {
@@ -166,17 +210,28 @@ func shortest(s []string) int {
 	return n
 }
 
-// Expiry is the last day the row is in force, or the zero time for "never".
+// Expiry is the last day the row is in force, or the zero time for "never" and open rows.
 func (r Row) Expiry() time.Time {
-	if r.Until == "never" {
+	if r.Until == "never" || r.Until == "" {
 		return time.Time{}
 	}
+	t, _ := time.Parse(dateLayout, r.Until)
+	return t
+}
+
+// Quiet reports whether an open row has gone quietLife without surfacing, counting from its last
+// hit or, if it never surfaced, from Since. Quiet rows still match; review lists them so each one
+// gets an until date, `never`, or retirement on purpose.
+func (r Row) Quiet(lastHit string, today time.Time) bool {
 	if r.Until != "" {
-		t, _ := time.Parse(dateLayout, r.Until)
-		return t
+		return false
 	}
-	s, _ := time.Parse(dateLayout, r.Since)
-	return s.Add(defaultLife)
+	from := r.Since
+	if lastHit > from {
+		from = lastHit
+	}
+	f, err := time.Parse(dateLayout, from)
+	return err == nil && today.Format(dateLayout) > f.Add(quietLife).Format(dateLayout)
 }
 
 // Lapsed reports whether today's local date is past the row's expiry. A lapsed row stops matching

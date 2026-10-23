@@ -17,7 +17,8 @@ text arrives:
 
 A row surfaces at most once per session, at most three rows per hit. Each is framed as a hypothesis
 with its check command; whether to run it is the agent's call. At session start the hook
-stays quiet unless some row has passed its until date, and then it says so in one line.
+stays quiet unless some row has passed its until date or gone quiet (below), and then it says so
+in one line.
 
 ## The table
 
@@ -30,7 +31,8 @@ tab-separated fields; blank lines and `#` comments are ignored:
 - `match` is an RE2 regex (`(?i)` for case-insensitive).
 - `where` is `in`, `out` or `reply`, from the table above.
 - `since` is the `YYYY-MM-DD` date the cause was learned. It is required.
-- `until` is `YYYY-MM-DD`, `never`, or `-` for since + 30 days, so nothing is permanent by accident.
+- `until` is `YYYY-MM-DD` for a hard end (the row stops matching after that day), `never`, or `-`
+  for open: no end date, but the row is flagged once it goes quiet.
 - `check` is a shell command whose exit 0 means the cause still holds, or `-` for none. It runs
   under `sh -c` from your home directory, so use absolute or `~` paths.
 - `source` is free text telling the agent where the cause came from, or `-`.
@@ -41,11 +43,29 @@ check that cannot run (timeout, missing binary) keeps its row. After a review th
 this:
 
     # resolved
-    old-proxy	407 Proxy Authentication	out	The corporate proxy needs a token.	2026-09-01	-	-	setup notes · resolved 2026-10-01 (past until 2026-10-01)
+    old-proxy	407 Proxy Authentication	out	The corporate proxy needs a token.	2026-09-01	2026-10-01	-	setup notes · resolved 2026-10-02 (past until 2026-10-01)
+
+An open row that has not surfaced in 60 days (counting from `since` if it never has) is quiet. It
+keeps matching, because an old cause can still be the right one, but `lint`, `review` and the
+session-start line list it until you give it an until date, mark it `never`, or move it under
+`# resolved` yourself. That is the pressure that keeps the table relevant; nothing retires on age
+alone.
+
+### Skipping documentation
+
+A cause gets written down in tickets and notes, so reading those would match the row that
+documents it. Two optional lines at the top of the table stop that:
+
+    #! skip-tools ^mcp__linear
+    #! skip-text open-asks\.md|/memory/
+
+`skip-tools` is a regex over the tool name; a matching call is not checked at all. `skip-text` is a
+regex over the call's input, such as a command that greps a notes file. Each may appear once.
 
 The hook records which rows a session has seen under `$BECAUSE_STATE_DIR` (default
 `because/` in your user cache directory, `~/.cache/because` on Linux), and removes those records
-after 14 days.
+after 14 days. The date each row last surfaced goes in `hits.tsv` there, which is what quiet is
+measured from.
 
 ## Example
 
@@ -104,7 +124,7 @@ when the text contains one of the literals any match would need, so a row costs 
 most calls: on 64 KiB of build output a call takes about 6 ms with a few dozen rows and 40 ms with
 a thousand. A hit injects at most three rows, each row once per session, cut to 9,000 characters so
 Claude Code delivers it inline rather than moving it to a file. `because lint` warns past 500 active
-rows or a row over 800 characters. The default 30-day `until` is what keeps the table small: rows lapse unless renewed.
+rows or a row over 800 characters.
 
 ## Security
 
