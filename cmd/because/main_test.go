@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,14 +111,14 @@ func TestASurfacedRowStampsItsLastHit(t *testing.T) {
 }
 
 func TestSkipDirectivesStopMatchesOnDocumentationOfACause(t *testing.T) {
-	setup(t, "#! skip-tools ^mcp__linear\n#! skip-text open-asks\\.md|/memory/\n"+
+	setup(t, "#! skip-tools ^mcp__linear\n#! skip-text notes\\.md|/memory/\n"+
 		"pat\tDEPLOY_TOKEN\tin\tRotated.\t2026-10-11\t-\t-\tx\n"+
 		"err\tDependabot alerts are disabled\tout\tOff on purpose.\t2026-10-18\t-\t-\tx\n")
 	for name, in := range map[string]map[string]any{
 		"ticket read": {"hook_event_name": "PostToolUse", "session_id": "a", "tool_name": "mcp__linear__get_issue",
 			"tool_input": map[string]any{"id": "X-1"}, "tool_response": map[string]any{"text": "Dependabot alerts are disabled"}},
 		"notes grep": {"hook_event_name": "PreToolUse", "session_id": "b", "tool_name": "Bash",
-			"tool_input": map[string]any{"command": "rg DEPLOY_TOKEN ~/notes/open-asks.md"}},
+			"tool_input": map[string]any{"command": "rg DEPLOY_TOKEN ~/work/notes.md"}},
 	} {
 		if out := hook(t, in); out != "" {
 			t.Errorf("%s surfaced: %q", name, out)
@@ -407,18 +408,30 @@ func BenchmarkHitsOnALongLog(b *testing.B) {
 	}
 }
 
-func TestARowSurfacingInManySessionsIsLoudUnlessNever(t *testing.T) {
+func TestARowSurfacingOnManyDaysIsLoudButParallelSessionsCountOnce(t *testing.T) {
 	setup(t, "wide\tboom\tout\tc\t2026-10-01\t-\t-\ts\nrecurs\tbang\tout\tc\t2026-10-01\tnever\t-\ts\n")
-	for i := range loudAfter + 1 {
-		hook(t, map[string]any{
-			"hook_event_name": "PostToolUse", "session_id": fmt.Sprintf("s%d", i), "tool_input": map[string]any{"command": "x"},
+	fire := func(session string, day time.Time) {
+		b, _ := json.Marshal(map[string]any{
+			"hook_event_name": "PostToolUse", "session_id": session, "tool_input": map[string]any{"command": "x"},
 			"tool_response": map[string]any{"stdout": "boom bang"},
 		})
+		if err := runHook(bytes.NewReader(b), io.Discard, day); err != nil {
+			t.Fatal(err)
+		}
 	}
-	recent := recentSessions(today)
+	for i := range 20 {
+		fire(fmt.Sprintf("same-day-%d", i), today)
+	}
 	tb, _ := load()
+	if isLoud(tb.Active[0], recentDays(today)) {
+		t.Fatal("twenty parallel sessions on one day counted as loud")
+	}
+	for d := range loudAfter + 1 {
+		fire(fmt.Sprintf("day-%d", d), today.Add(-time.Duration(d+1)*24*time.Hour))
+	}
+	recent := recentDays(today)
 	if !isLoud(tb.Active[0], recent) {
-		t.Fatalf("wide row not loud after %d sessions", recent["wide"])
+		t.Fatalf("row surfacing on %d days not loud", recent["wide"])
 	}
 	if isLoud(tb.Active[1], recent) {
 		t.Fatal("a never row was flagged loud")
@@ -427,8 +440,9 @@ func TestARowSurfacingInManySessionsIsLoudUnlessNever(t *testing.T) {
 	if err := runReview(&out, false, today); err != nil || !strings.Contains(out.String(), "LOUD   wide") {
 		t.Fatalf("review did not list it: %v\n%s", err, out.String())
 	}
-	compactHits(today.Add(90 * 24 * time.Hour))
-	if loadHits()["wide"] != today.Format(dateLayout) || recentSessions(today.Add(90 * 24 * time.Hour))["wide"] != 0 {
-		t.Fatal("compaction lost the last hit or kept old sessions")
+	later := today.Add(90 * 24 * time.Hour)
+	compactHits(later)
+	if loadHits()["wide"] != today.Format(dateLayout) || recentDays(later)["wide"] != 0 {
+		t.Fatal("compaction lost the last hit or kept old days")
 	}
 }

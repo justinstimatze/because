@@ -44,7 +44,7 @@ const (
 	maxActive   = 500
 	maxMessage  = 9000
 	loudWindow  = 30 * 24 * time.Hour
-	loudAfter   = 5 // sessions within loudWindow
+	loudAfter   = 10 // distinct days within loudWindow
 )
 
 func main() {
@@ -137,7 +137,7 @@ func runHook(in io.Reader, out io.Writer, now time.Time) error {
 	case "SessionStart":
 		sweepSeen(now)
 		compactHits(now)
-		hits, recent := loadHits(), recentSessions(now)
+		hits, recent := loadHits(), recentDays(now)
 		lapsed, quiet, loud := 0, 0, 0
 		for _, r := range t.Active {
 			switch {
@@ -157,7 +157,7 @@ func runHook(in io.Reader, out io.Writer, now time.Time) error {
 			parts = append(parts, fmt.Sprintf("%d open row(s) have not surfaced in %d days", quiet, int(quietLife.Hours()/24)))
 		}
 		if loud > 0 {
-			parts = append(parts, fmt.Sprintf("%d row(s) surfaced in more than %d sessions this month", loud, loudAfter))
+			parts = append(parts, fmt.Sprintf("%d row(s) surfaced on more than %d of the last 30 days", loud, loudAfter))
 		}
 		if len(parts) > 0 {
 			emitContext(out, h.Event, "because: "+strings.Join(parts, "; ")+". Run `because review` to retire, renew or date them.")
@@ -318,7 +318,7 @@ func unseen(session string, rows []Row, now time.Time) []Row {
 	return out
 }
 
-// isLoud reports a row that surfaced in more than loudAfter sessions within loudWindow, which
+// isLoud reports a row that surfaced on more than loudAfter days within loudWindow, which
 // usually means its match is wider than its cause. `never` rows are exempt: that is how a row whose
 // error genuinely recurs opts out.
 func isLoud(r Row, recent map[string]int) bool {
@@ -354,12 +354,15 @@ func loadHits() map[string]string {
 	return m
 }
 
-// recentSessions counts, per row, the sessions it surfaced in during the last loudWindow.
-func recentSessions(now time.Time) map[string]int {
+// recentDays counts, per row, the distinct days it surfaced on during the last loudWindow. Days,
+// not sessions, so parallel sessions on one day count once.
+func recentDays(now time.Time) map[string]int {
 	from := now.Add(-loudWindow).Format(dateLayout)
+	seen := map[[2]string]bool{}
 	m := map[string]int{}
 	for _, h := range readHits() {
-		if h[1] >= from {
+		if h[1] >= from && !seen[h] {
+			seen[h] = true
 			m[h[0]]++
 		}
 	}
@@ -531,7 +534,7 @@ func runLint(out io.Writer, now time.Time) error {
 		}
 		ids[r.ID] = r.Line
 	}
-	hits, recent := loadHits(), recentSessions(now)
+	hits, recent := loadHits(), recentDays(now)
 	for _, r := range t.Active {
 		state := "active"
 		switch {
@@ -589,7 +592,7 @@ func runReview(out io.Writer, apply bool, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	hits, recent := loadHits(), recentSessions(now)
+	hits, recent := loadHits(), recentDays(now)
 	var vs []verdict
 	for _, r := range t.Active {
 		v := verdict{row: r}
@@ -616,7 +619,7 @@ func runReview(out io.Writer, apply bool, now time.Time) error {
 		}
 		if isLoud(r, recent) && !v.retire {
 			v.loud = true
-			v.why += fmt.Sprintf("; loud: surfaced in %d sessions in %d days", recent[r.ID], int(loudWindow.Hours()/24))
+			v.why += fmt.Sprintf("; loud: surfaced on %d of the last %d days", recent[r.ID], int(loudWindow.Hours()/24))
 		}
 		vs = append(vs, v)
 	}

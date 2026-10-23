@@ -17,13 +17,14 @@ text arrives:
 
 A row surfaces at most once per session, at most three rows per hit. Each is framed as a hypothesis
 with its check command; whether to run it is the agent's call. At session start the hook
-stays quiet unless some row has passed its until date, gone quiet or gone loud (below), and then it
+stays quiet unless some row needs review (see [Staying relevant](#staying-relevant)), and then it
 says so
 in one line.
 
 ## The table
 
-`~/.claude/because.tsv` (or `$BECAUSE_FILE`), created and edited by hand. One row per line, eight
+`~/.claude/because.tsv` (or `$BECAUSE_FILE`; `because path` prints which). Create and edit it in a
+text editor that keeps tab characters. One row per line, eight
 tab-separated fields; blank lines and `#` comments are ignored:
 
     id  match  where  cause  since  until  check  source
@@ -32,8 +33,8 @@ tab-separated fields; blank lines and `#` comments are ignored:
 - `match` is an RE2 regex (`(?i)` for case-insensitive).
 - `where` is `in`, `out` or `reply`, from the table above.
 - `since` is the `YYYY-MM-DD` date the cause was learned. It is required.
-- `until` is `YYYY-MM-DD` for a hard end (the row stops matching after that day), `never`, or `-`
-  for open: no end date, but the row is flagged once it goes quiet.
+- `until` is `YYYY-MM-DD` for a hard end (the row stops matching after that day), `-` for open (no
+  end date, flagged for review when it goes quiet or loud), or `never` (no end date, never flagged).
 - `check` is a shell command whose exit 0 means the cause still holds, or `-` for none. It runs
   under `sh -c` from your home directory, so use absolute or `~` paths.
 - `source` is free text telling the agent where the cause came from, or `-`.
@@ -46,13 +47,16 @@ this:
     # resolved
     old-proxy	407 Proxy Authentication	out	The corporate proxy needs a token.	2026-09-01	2026-10-01	-	setup notes · resolved 2026-10-02 (past until 2026-10-01)
 
+### Staying relevant
+
 An open row that has not surfaced in 60 days (counting from `since` if it never has) is quiet. It
 keeps matching, because an old cause can still be the right one, but `lint`, `review` and the
 session-start line list it until you give it an until date, mark it `never`, or move it under
 `# resolved` yourself. That is the pressure that keeps the table relevant; nothing retires on age
 alone.
 
-The opposite signal is loud: a row that surfaced in more than five sessions in 30 days. That
+The opposite signal is loud: a row that surfaced on more than 10 of the last 30 days
+(parallel sessions on one day count once). That
 usually means the match is wider than the cause, so `lint` and `review` list it for narrowing. A
 row whose error genuinely keeps recurring can be marked `never`, which exempts it.
 
@@ -62,9 +66,9 @@ A cause gets written down in tickets and notes, so reading those would match the
 documents it. Two optional lines at the top of the table stop that:
 
     #! skip-tools ^mcp__linear
-    #! skip-text open-asks\.md|/memory/
+    #! skip-text notes\.md|/memory/
 
-`skip-tools` is a regex over the tool name; a matching call is not checked at all. `skip-text` is a
+`skip-tools` is a regex over the tool name, here every tool of a Linear (issue tracker) MCP server; a matching call is not checked at all. `skip-text` is a
 regex over the call's input, such as a command that greps a notes file. Each may appear once.
 
 The hook records which rows a session has seen under `$BECAUSE_STATE_DIR` (default
@@ -76,9 +80,10 @@ are measured from it, and lines older than 30 days are dropped except each row's
 
 A row that explains a failure the agent would otherwise debug:
 
-    staging-down	(?i)staging.{0,80}502 Bad Gateway	out	Staging is down for the database migration; prod is unaffected.	2026-10-18	2026-10-25	! curl -sf https://staging.example.com/healthz	migration plan
+    staging-down	(?i)staging.{0,80}502 Bad Gateway	out	Staging is down for the database migration; prod is unaffected.	2026-10-18	-	! curl -sf https://staging.example.com/healthz	migration plan
 
-Check it before relying on the hook:
+The check inverts `curl`, so it exits 0, meaning the cause still holds, while the health check fails.
+Try the row before relying on the hook:
 
     $ because match out 'GET https://staging.example.com/api -> 502 Bad Gateway'
     Matches: Treat each as a hypothesis until its check runs:
@@ -104,7 +109,7 @@ Requires Go 1.26 or later, on Linux or macOS.
     go install github.com/justinstimatze/because/cmd/because@latest
 
 or `make install` from a clone, which runs `go install` with the version stamped from the git tag.
-Then register the hook in `~/.claude/settings.json`. The `mcp__.*` matcher covers output from every
+Then register the hook in `~/.claude/settings.json`, alongside any hooks already there. The `mcp__.*` matcher covers output from every
 MCP server's tools:
 
 ```json
