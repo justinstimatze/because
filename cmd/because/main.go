@@ -41,7 +41,7 @@ const (
 	checkLimit  = 20 * time.Second
 	seenLife    = 14 * 24 * time.Hour
 	maxRowChars = 800
-	maxActive   = 150
+	maxActive   = 500
 	maxMessage  = 9000
 )
 
@@ -445,7 +445,7 @@ func runLint(out io.Writer, now time.Time) error {
 		}
 	}
 	if len(t.Active) > maxActive {
-		fmt.Fprintf(out, "warning: %d active rows; every hooked tool call matches all of them, so retire or narrow rows past %d\n", len(t.Active), maxActive)
+		fmt.Fprintf(out, "warning: %d active rows; every hooked call parses all of them; retire rows that no longer earn a place past %d\n", len(t.Active), maxActive)
 	}
 	return nil
 }

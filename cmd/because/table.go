@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"regexp/syntax"
 	"strings"
 	"time"
 )
@@ -23,6 +24,9 @@ type Row struct {
 	Check  string // shell command; exit 0 means the cause still holds
 	Source string
 	Line   int
+	// need holds lowercase literals of which any match must contain at least one, or nil when the
+	// regex has none worth checking. Hits skips the regex when none of them is in the text.
+	need []string
 }
 
 const (
@@ -108,7 +112,58 @@ func parseRow(line string, n int) (Row, error) {
 		return Row{}, fmt.Errorf("line %d (%s): match: %v", n, row.ID, err)
 	}
 	row.Match = re
+	if ast, err := syntax.Parse(row.Raw, syntax.Perl); err == nil {
+		row.need = required(ast.Simplify())
+	}
 	return row, nil
+}
+
+// minNeed is the shortest literal worth a substring check; shorter ones appear in most text anyway.
+const minNeed = 3
+
+// required returns lowercase literals of which every match of re contains at least one, or nil if
+// it cannot say. Lowercasing both sides keeps it a necessary condition for (?i) patterns too.
+func required(re *syntax.Regexp) []string {
+	switch re.Op {
+	case syntax.OpLiteral:
+		if s := strings.ToLower(string(re.Rune)); len(s) >= minNeed {
+			return []string{s}
+		}
+	case syntax.OpCapture, syntax.OpPlus:
+		return required(re.Sub[0])
+	case syntax.OpRepeat:
+		if re.Min >= 1 {
+			return required(re.Sub[0])
+		}
+	case syntax.OpConcat:
+		// Any one child's set is a valid condition; take the one whose shortest literal is longest.
+		var best []string
+		for _, sub := range re.Sub {
+			if s := required(sub); s != nil && (best == nil || shortest(s) > shortest(best)) {
+				best = s
+			}
+		}
+		return best
+	case syntax.OpAlternate:
+		var all []string
+		for _, sub := range re.Sub {
+			s := required(sub)
+			if s == nil {
+				return nil
+			}
+			all = append(all, s...)
+		}
+		return all
+	}
+	return nil
+}
+
+func shortest(s []string) int {
+	n := len(s[0])
+	for _, x := range s[1:] {
+		n = min(n, len(x))
+	}
+	return n
 }
 
 // Expiry is the last day the row is in force, or the zero time for "never".
@@ -135,10 +190,31 @@ func (r Row) Lapsed(today time.Time) bool {
 // Hits returns the active, unlapsed rows for where whose regex matches text, in file order.
 func (t *Table) Hits(where, text string, today time.Time) []Row {
 	var out []Row
+	lower := ""
 	for _, r := range t.Active {
-		if r.Where == where && !r.Lapsed(today) && r.Match.MatchString(text) {
+		if r.Where != where || r.Lapsed(today) {
+			continue
+		}
+		if r.need != nil {
+			if lower == "" {
+				lower = strings.ToLower(text)
+			}
+			if !containsAny(lower, r.need) {
+				continue
+			}
+		}
+		if r.Match.MatchString(text) {
 			out = append(out, r)
 		}
 	}
 	return out
+}
+
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }

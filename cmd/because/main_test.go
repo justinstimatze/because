@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -309,5 +310,55 @@ func TestAnInjectionStaysUnderClaudeCodesHookTextCap(t *testing.T) {
 	}
 	if len(v.H.C) >= 10000 {
 		t.Fatalf("context is %d characters", len(v.H.C))
+	}
+}
+
+func TestThePrefilterNeverRejectsARealMatch(t *testing.T) {
+	for _, c := range []struct{ re, text string }{
+		{`Dependabot alerts are disabled`, "HTTP 403: Dependabot alerts are disabled for this repository."},
+		{`(?i)widget cache.{0,60}off by default`, "The WIDGET CACHE is OFF by default"},
+		{`(?i)staging.{0,80}502 Bad Gateway`, "GET https://staging.example.com -> 502 bad gateway"},
+		{`(foo|barbaz)qux`, "fooqux"},
+		{`(abc)+def`, "abcabcdef"},
+		{`x?yz`, "yz"},
+		{`ERR_[A-Z]+_TIMEOUT`, "ERR_DNS_TIMEOUT"},
+		{`(?i)kelvin`, "Kelvin"},
+	} {
+		row, err := parseRow("r\t"+c.re+"\tout\tc\t2026-10-18\tnever\t-\ts", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !row.Match.MatchString(c.text) {
+			t.Fatalf("%s: test text does not match the regex itself", c.re)
+		}
+		tb := &Table{Active: []Row{row}}
+		if len(tb.Hits("out", c.text, today)) != 1 {
+			t.Errorf("%s: prefilter %q rejected %q", c.re, row.need, c.text)
+		}
+	}
+}
+
+func TestThePrefilterSkipsRowsWhoseLiteralIsAbsent(t *testing.T) {
+	row, _ := parseRow("r\t(?i)staging.{0,80}502 Bad Gateway\tout\tc\t2026-10-18\tnever\t-\ts", 1)
+	if len(row.need) == 0 {
+		t.Fatal("no literal extracted")
+	}
+	if containsAny(strings.ToLower("compiling...\nok\n"), row.need) {
+		t.Fatal("prefilter passed text with neither literal")
+	}
+}
+
+func BenchmarkHitsOnALongLog(b *testing.B) {
+	var sb strings.Builder
+	for i := range 200 {
+		fmt.Fprintf(&sb, "r%d\t(?i)some unusual error text number %d.{0,40}here\tout\tc\t2026-10-20\tnever\t-\ts\n", i, i)
+	}
+	tb, err := Parse(strings.NewReader(sb.String()))
+	if err != nil {
+		b.Fatal(err)
+	}
+	text := capped(strings.Repeat("compiling...\n", 6000))
+	for b.Loop() {
+		tb.Hits("out", text, today)
 	}
 }

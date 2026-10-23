@@ -98,11 +98,13 @@ through. A table that fails to parse is reported at session start.
 
 ## Limits
 
-Each hooked call reads and compiles the whole table, then matches every active row for that hook
-against at most 64 KiB of text (the first and last 32 KiB of longer output). A hit injects at most
-three rows, each row once per session, cut to 9,000 characters so Claude Code delivers it inline
-rather than moving it to a file. `because lint` warns past 150 active rows or a row over 800
-characters. The default 30-day `until` is what keeps the table small: rows lapse unless renewed.
+Each hooked call reads and compiles the whole table, then checks every active row for that hook
+against at most 64 KiB of text (the first and last 32 KiB of longer output). A row's regex runs only
+when the text contains one of the literals any match would need, so a row costs a substring scan on
+most calls: on 64 KiB of build output a call takes about 6 ms with a few dozen rows and 40 ms with
+a thousand. A hit injects at most three rows, each row once per session, cut to 9,000 characters so
+Claude Code delivers it inline rather than moving it to a file. `because lint` warns past 500 active
+rows or a row over 800 characters. The default 30-day `until` is what keeps the table small: rows lapse unless renewed.
 
 ## Security
 
