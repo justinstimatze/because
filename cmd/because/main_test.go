@@ -291,3 +291,23 @@ func TestACheckThatLeavesABackgroundProcessDoesNotHang(t *testing.T) {
 		t.Fatalf("check waited %s on a background child", d)
 	}
 }
+
+func TestAnInjectionStaysUnderClaudeCodesHookTextCap(t *testing.T) {
+	long := strings.Repeat("x", 5000)
+	setup(t, "a\tboom\tout\t"+long+"\t2026-10-18\t-\t-\ts\nb\tboom\tout\t"+long+"\t2026-10-18\t-\t-\ts\n")
+	out := hook(t, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "s", "tool_input": map[string]any{"command": "x"},
+		"tool_response": map[string]any{"stdout": "boom"},
+	})
+	var v struct {
+		H struct {
+			C string `json:"additionalContext"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil || v.H.C == "" {
+		t.Fatalf("no context: %q", out)
+	}
+	if len(v.H.C) >= 10000 {
+		t.Fatalf("context is %d characters", len(v.H.C))
+	}
+}

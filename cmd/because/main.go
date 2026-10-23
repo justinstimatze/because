@@ -40,6 +40,9 @@ const (
 	maxHaystack = 64 * 1024
 	checkLimit  = 20 * time.Second
 	seenLife    = 14 * 24 * time.Hour
+	maxRowChars = 800
+	maxActive   = 150
+	maxMessage  = 9000
 )
 
 func main() {
@@ -195,7 +198,12 @@ func render(rows []Row, lead string) string {
 		}
 		b.WriteString("\n")
 	}
-	return strings.TrimRight(b.String(), "\n")
+	s := strings.TrimRight(b.String(), "\n")
+	// Claude Code moves hook text over 10,000 characters to a file the agent is not asked to read.
+	if len(s) > maxMessage {
+		s = s[:maxMessage] + " …"
+	}
+	return s
 }
 
 // touchesTable is true for a call that reads or edits the table itself, whose text matches every
@@ -431,6 +439,14 @@ func runLint(out io.Writer, now time.Time) error {
 		fmt.Fprintf(out, "%-6s %-24s %-5s until %s\n", state, r.ID, r.Where, exp)
 	}
 	fmt.Fprintf(out, "%d active, %d resolved\n", len(t.Active), len(t.Resolved))
+	for _, r := range t.Active {
+		if n := len(r.Cause) + len(r.Check) + len(r.Source); n > maxRowChars {
+			fmt.Fprintf(out, "warning: %s injects %d characters; keep a row under %d so three fit well inside one hook message\n", r.ID, n, maxRowChars)
+		}
+	}
+	if len(t.Active) > maxActive {
+		fmt.Fprintf(out, "warning: %d active rows; every hooked tool call matches all of them, so retire or narrow rows past %d\n", len(t.Active), maxActive)
+	}
 	return nil
 }
 
